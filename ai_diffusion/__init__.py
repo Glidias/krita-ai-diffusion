@@ -12,6 +12,8 @@ if not importlib.util.find_spec(".websockets.src", "ai_diffusion"):
         " https://github.com/Acly/krita-ai-diffusion/releases"
     )
 
+from .ui import register_extensions
+
 # The following imports depend on the code running inside Krita
 if importlib.util.find_spec("krita"):
     import krita

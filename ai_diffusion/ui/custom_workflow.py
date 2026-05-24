@@ -1,12 +1,13 @@
 import math
 from collections.abc import Callable
+from enum import Enum
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from krita import Krita
 from PyQt5.QtCore import QMetaObject, QPoint, QSize, Qt, QUrl, QUuid, pyqtSignal
-from PyQt5.QtGui import QDesktopServices, QFontMetrics, QIcon, QPalette
+from PyQt5.QtGui import QDesktopServices, QFontMetrics, QIcon, QPalette, QPainter, QColor
 from PyQt5.QtWidgets import (
     QAction,
     QComboBox,
@@ -54,6 +55,133 @@ from .settings_widgets import ExpanderButton
 from .switch import SwitchWidget
 from .theme import SignalBlocker
 from .widget import ErrorBox, StyleSelectWidget, TextPromptWidget, WorkspaceSelectWidget
+
+
+# ===== PARAM EXTENSIONS =====
+def _get_color_mode(param: CustomParam) -> str | None:
+    if param.kind == ParamKind.number_int:
+        if param.min == 0 and param.max == 255:
+            return "gray8"
+        elif param.min == 0 and param.max == 16777215:
+            return "rgb24"
+    elif param.kind == ParamKind.number_float:
+        if param.min == 0.0 and param.max == 1.0:
+            return "grayf"
+    return None
+
+
+PARAM_EXTENSIONS: dict[tuple[Enum, str], Callable[[], Any]] = {}
+
+
+def register_param_extension(kind: Enum, name: str, callback: Callable[[], Any]):
+    """Register an extension for a specific parameter kind."""
+    PARAM_EXTENSIONS[(kind, name)] = callback
+
+
+def _run_param_extension(callback, widget, param):
+    try:
+        result = callback()
+        if result is None:
+            return
+        widget.value = result
+    except Exception as e:
+        QMessageBox.critical(None, _("Extension Error"), f"Failed:\n{str(e)}")
+
+
+def _wrap_with_param_extension_menu(widget, param: CustomParam, parent: QWidget):
+    """Add extension menu to any parameter widget."""
+    kind = param.kind
+    extensions = [
+        (name, cb) for (k, name), cb in PARAM_EXTENSIONS.items() if k == kind
+    ]
+    if not extensions:
+        return widget
+
+    container = QWidget(parent)
+    layout = QHBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(widget)
+
+    menu_button = QToolButton(container)
+    menu_button.setPopupMode(QToolButton.InstantPopup)
+    menu_button.setFixedWidth(20)
+    menu_button.setStyleSheet("QToolButton { border: none; padding: 0px; }")
+    menu_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    menu = QMenu(menu_button)
+    for name, callback in extensions:
+        action = menu.addAction(name.replace("_", " ").title())
+        action.triggered.connect(
+            lambda _, cb=callback, w=widget, p=param: _run_param_extension(cb, w, p)
+        )
+    menu_button.setMenu(menu)
+    layout.addWidget(menu_button)
+
+    if (mode := _get_color_mode(param)) is not None:
+        preview = _ColorPreview(container)
+        layout.insertWidget(0, preview)
+
+        def update_preview():
+            try:
+                val = widget.value
+                if mode == "grayf" and isinstance(val, (int, float)):
+                    val = int(round(float(val) * 255)) if 0.0 <= val <= 1.0 else None
+                elif mode in ("gray8", "rgb24") and isinstance(val, (int, float)):
+                    val = int(val)
+                else:
+                    val = None
+                preview.set_color_by_mode(val, mode)
+            except (ValueError, TypeError):
+                preview.set_color_by_mode(None, mode)
+
+        widget.value_changed.connect(update_preview)
+        update_preview()
+
+    container.param = param
+    container.value_changed = widget.value_changed
+    container.__class__ = type(
+        "WrappedParamWidget",
+        (QWidget,),
+        {"value": property(lambda s: widget.value, lambda s, v: setattr(widget, "value", v))},
+    )
+    return container
+
+
+class _ColorPreview(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(16, 16)
+        self._color = None
+
+    def set_color_by_mode(self, value: int | None, mode: str):
+        if value is None or value < 0:
+            self._color = None
+        elif mode == "gray8" and 0 <= value <= 255:
+            self._color = QColor(value, value, value)
+        elif mode == "grayf" and 0.0 <= value <= 1.0:
+            v = int(round(value * 255))
+            self._color = QColor(v, v, v)
+        elif mode == "rgb24" and 0 <= value <= 16777215:
+            r, g, b = (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF
+            self._color = QColor(r, g, b)
+        else:
+            self._color = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        rect = self.rect()
+        if self._color and self._color.isValid():
+            painter.fillRect(rect, self._color)
+            r, g, b = self._color.red(), self._color.green(), self._color.blue()
+            luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+            border_color = Qt.GlobalColor.black if luminance > 0.5 else Qt.GlobalColor.white
+            painter.setPen(border_color)
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        else:
+            painter.fillRect(rect, self.palette().color(self.backgroundRole()))
+            painter.setPen(Qt.GlobalColor.lightGray)
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
 
 
 class LayerSelect(QComboBox):
@@ -429,27 +557,28 @@ def _create_param_widget(
 ) -> CustomParamWidget:
     match param.kind:
         case ParamKind.image_layer:
-            return LayerSelect("image", model, parent)
+            widget = LayerSelect("image", model, parent)
         case ParamKind.mask_layer:
-            return LayerSelect("mask", model, parent)
+            widget = LayerSelect("mask", model, parent)
         case ParamKind.number_int:
-            return IntParamWidget(param, parent)
+            widget = IntParamWidget(param, parent)
         case ParamKind.number_float:
-            return FloatParamWidget(param, parent)
+            widget = FloatParamWidget(param, parent)
         case ParamKind.toggle:
-            return BoolParamWidget(param, parent)
+            widget = BoolParamWidget(param, parent)
         case ParamKind.text:
-            return TextParamWidget(param, parent)
+            widget = TextParamWidget(param, parent)
         case ParamKind.prompt_positive | ParamKind.prompt_negative:
-            w = PromptParamWidget(param, parent)
-            w.activated.connect(parent.activated)
-            return w
+            widget = PromptParamWidget(param, parent)
+            widget.activated.connect(parent.activated)
         case ParamKind.choice:
-            return ChoiceParamWidget(param, parent)
+            widget = ChoiceParamWidget(param, parent)
         case ParamKind.style:
-            return StyleParamWidget(parent)
+            widget = StyleParamWidget(parent)
         case _:
             assert False, f"Unknown param kind: {param.kind}"
+
+    return _wrap_with_param_extension_menu(widget, param, parent)
 
 
 def _create_reset_button(parent: QWidget, text: str):
